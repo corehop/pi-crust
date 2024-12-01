@@ -1,103 +1,59 @@
-#include <mouse.h>
+#include "mouse.h"
 
 #define LEFT_BUTTON 1
 #define MIDDLE_BUTTON 2
 #define RIGHT_BUTTON 3
-#define VSCROLL_UP 4
-#define VSCROLL_DOWN 5
-#define BACK_BUTTON 6
-#define FORWARD_BUTTON 7
 
-Mouse::Mouse(std::string hid_device)
-{
-    this->hid_device = hid_device;
-
+Mouse::Mouse(FILE *hid_pipe) {
+    this->hid_pipe = hid_pipe;
     this->updated_once = false;
-
     this->x_previous = 0;
     this->y_previous = 0;
+    this->x_delta = 0;
+    this->y_delta = 0;
+    this->wheel_delta = 0; // Initialize wheel delta
 }
 
-void Mouse::button_pressed_handler(int button)
-{
+void Mouse::button_pressed_handler(int button) {
     this->pressed_buttons[button] = true;
+    send_mouse_report(); // Send report immediately on button press
 }
 
-void Mouse::button_released_handler(int button)
-{
+void Mouse::button_released_handler(int button) {
     this->pressed_buttons[button] = false;
+    send_mouse_report(); // Send report immediately on button release
 }
 
-void Mouse::update_position(int x, int y)
-{
-    if (updated_once == false)
-    {
-        this->x_delta = 0;
-        this->y_delta = 0;
-
-        updated_once = true;
-    }
-    else
-    {
-        this->x_delta = x - this->x_previous;
-        this->y_delta = y - this->y_previous;
-    }
-
-    this->x_previous = x;
-    this->y_previous = y;
+void Mouse::update_position(int x, int y) {
+    this->x_delta = x;
+    this->y_delta = y;
 }
 
-void Mouse::send_mouse_report()
-{
-    FILE *hid_pipe = fopen(this->hid_device.c_str(), "w");
-    
+void Mouse::wheel_movement_handler(int delta) {
+    this->wheel_delta = (int8_t)delta;  // Store wheel movement delta (cast to 8-bit)
+    send_mouse_report(); // Send report immediately on wheel movement
+}
+
+void Mouse::send_mouse_report() {
+    // Encode the buttons as a single byte
     uint8_t buttons = 0;
-    int8_t scroll = 0;
+    if (pressed_buttons[LEFT_BUTTON]) buttons |= (1 << 0);
+    if (pressed_buttons[RIGHT_BUTTON]) buttons |= (1 << 1);
+    if (pressed_buttons[MIDDLE_BUTTON]) buttons |= (1 << 2);
 
-    // Map from X11 button numbering to USB HID button numbering
-    buttons += pressed_buttons[LEFT_BUTTON] << 0;
-    buttons += pressed_buttons[RIGHT_BUTTON] << 1;
-    buttons += pressed_buttons[MIDDLE_BUTTON] << 2;
-    buttons += pressed_buttons[BACK_BUTTON] << 3;
-    buttons += pressed_buttons[FORWARD_BUTTON] << 4;
+    // HID report format: [Buttons][X low byte][X high byte][Y low byte][Y high byte][Wheel]
+    fprintf(hid_pipe, "%c%c%c%c%c%c",
+            buttons,                  // Button states
+            (uint8_t)(x_delta & 0xFF),         // X low byte
+            (uint8_t)((x_delta >> 8) & 0xFF),  // X high byte
+            (uint8_t)(y_delta & 0xFF),         // Y low byte
+            (uint8_t)((y_delta >> 8) & 0xFF),  // Y high byte
+            wheel_delta);             // Wheel movement
 
-    if (pressed_buttons[VSCROLL_UP])
-    {
-        scroll += 1;
-    }
+    fflush(hid_pipe); // Ensure immediate write to the HID device
 
-    if (pressed_buttons[VSCROLL_DOWN])
-    {
-       scroll -= 1;
-    }
-
-    // x_delta and y_delta
-    // need to be reported as:
-    // [bit 8 - 0] [bit 16 - 9]
-
-    uint8_t x1 = x_delta & 0xFF;
-    uint8_t x2 = x_delta >> 8;
-
-    uint8_t y1 = y_delta & 0xFF;
-    uint8_t y2 = y_delta >> 8;
-    // printf("x_delta: %d (%#04x), y_delta: %d\n", x_delta, x_delta, y_delta);
-    // printf("%#02x %#02x \n", x1, x2);
-
-    fprintf(
-       hid_pipe,
-       "%c%c%c%c%c%c",
-       buttons,
-       scroll,
-       x1,
-       x2,
-       y1,
-       y2);
-
-    // The deltas have been consumed, set to zero
-    // in the event that the mouse position has not 
-    // changed before we send the next report.
+    // Reset deltas after sending the report to avoid repeated movement
     x_delta = 0;
     y_delta = 0;
-
-   fclose(hid_pipe);
+    wheel_delta = 0; // Reset wheel delta after sending report
 }

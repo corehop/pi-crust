@@ -1,133 +1,121 @@
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "scancodes.h"
-#include <X11/XKBlib.h>
-
+#include <algorithm>  // for std::max and std::min
 #include "keyboard.h"
 #include "mouse.h"
 
-enum params
-{          //argv-indices:
-    P_EXE, //executable name
-    P_DEV_KEYBOARD, // keyboard device file
-    P_DEV_MOUSE,    // mouse device file
-    NUM_P  //number of parameters
-};
+enum params { P_EXE, P_DEV_KEYBOARD, P_DEV_MOUSE, NUM_P };
 
-enum errors
-{
-    ERR_SUCCESS,  //no error
-    ERR_ARGCOUNT, //wrong number of arguments
-    ERR_SYMBOL,   //symbol not in look up table
-    ERR_LAYOUT,   //parameter P_LAY does not contain a correct keyboard layout
-    ERR_LAZY      //i haven't done this
-};
-
-int main(int argc, char **argv)
-{
-    if (argc != NUM_P)
-    {
-        fprintf(stderr, "Usage: %s <device file> <layout> <unicode>\n", argv[P_EXE]);
-        fprintf(stderr, "Takes string to type from stdin\n");
-        fprintf(stderr, "<device file>:\ton the Raspberry Pi usually /dev/hidg0\n");
-
-        return ERR_ARGCOUNT;
+int main(int argc, char **argv) {
+    if (argc != NUM_P) {
+        fprintf(stderr, "Usage: %s <keyboard device file> <mouse device file>\n", argv[P_EXE]);
+        return 1;
     }
 
-    Display *display;
-    Window window;
-    XEvent event;
-    Keyboard kb = Keyboard(argv[P_DEV_KEYBOARD]);
-    Mouse mouse = Mouse(argv[P_DEV_MOUSE]);
+    // Set DISPLAY to :0 if it is not set
+    if (getenv("DISPLAY") == NULL) {
+        printf("DISPLAY not set, defaulting to :0\n");
+        setenv("DISPLAY", ":0", 1);
+    }
 
-    int eventLoopRunOnce = 0;
-    int s;
+    FILE *kbd_pipe = fopen(argv[P_DEV_KEYBOARD], "w");
+    if (!kbd_pipe) {
+        perror("Failed to open keyboard device");
+        return 1;
+    }
 
-    printf("Starting...\n");
-    // printf("Opening %s\n", argv[P_DEV]);
+    FILE *mouse_pipe = fopen(argv[P_DEV_MOUSE], "w");
+    if (!mouse_pipe) {
+        perror("Failed to open mouse device");
+        fclose(kbd_pipe);
+        return 1;
+    }
 
-    /* open connection with the server */
-    display = XOpenDisplay(NULL);
-    if (display == NULL)
-    {
+    Display *display = XOpenDisplay(NULL);
+    if (!display) {
         fprintf(stderr, "Cannot open display\n");
-        exit(1);
+        fclose(kbd_pipe);
+        fclose(mouse_pipe);
+        return 1;
     }
 
-    s = DefaultScreen(display);
+    // Get screen resolution
+    int screen_width = DisplayWidth(display, DefaultScreen(display));
+    int screen_height = DisplayHeight(display, DefaultScreen(display));
+    printf("Screen resolution: %dx%d\n", screen_width, screen_height);
 
-    /* get the display width and height */
-    int width = DisplayWidth(display, s);
-    int height = DisplayHeight(display, s);
+    Keyboard kb(kbd_pipe);
+    Mouse mouse(mouse_pipe);
 
-    /* create fullscreen window */
-    window = XCreateSimpleWindow(display, RootWindow(display, s), 0, 0, width, height, 1,
-                                 BlackPixel(display, s), WhitePixel(display, s));
+    Window window = DefaultRootWindow(display);
+    XSelectInput(display, window, KeyPressMask | KeyReleaseMask | PointerMotionMask | ButtonPressMask | ButtonReleaseMask);
 
-    /* select kind of events we are interested in */
-    XSelectInput(display, window, KeyPressMask | KeyReleaseMask | EnterWindowMask | LeaveWindowMask | PointerMotionMask | ButtonPressMask | ButtonReleaseMask);
+    int last_x = -1, last_y = -1;
 
-    /* map (show) the window */
-    XMapWindow(display, window);
+    while (1) {
+        while (XPending(display)) {
+            XEvent event;
+            XNextEvent(display, &event);
 
-    printf("Starting event loop...\n");
+            if (event.type == KeyPress) {
+                kb.key_down_handler(XLookupKeysym(&event.xkey, 0));
+                kb.send_keyboard_reports();
+            } else if (event.type == KeyRelease) {
+                kb.key_up_handler(XLookupKeysym(&event.xkey, 0));
+                kb.send_keyboard_reports();
+            } else if (event.type == MotionNotify) {
+                // Capture current mouse position
+                int current_x = event.xmotion.x;
+                int current_y = event.xmotion.y;
 
-    /* event loop */
-    while (1)
-    {
-        XNextEvent(display, &event);
+                // Initialize last position
+                if (last_x == -1 || last_y == -1) {
+                    last_x = current_x;
+                    last_y = current_y;
+                    continue;
+                }
 
-        /* keyboard events */
-        if (event.type == KeyPress)
-        {
-            KeySym keysym = XLookupKeysym(&event.xkey, 0); 
-            kb.key_down_handler(keysym);
+                // Calculate relative movement
+                int delta_x = current_x - last_x;
+                int delta_y = current_y - last_y;
+
+                // Clamp the deltas to the 16-bit HID range (-32768 to 32767)
+                delta_x = std::max(-32768, std::min(32767, delta_x));
+                delta_y = std::max(-32768, std::min(32767, delta_y));
+
+                // Update mouse position and send report
+                if (delta_x != 0 || delta_y != 0) {
+                    mouse.update_position(delta_x, delta_y);
+                    mouse.send_mouse_report();
+
+                    // Update last position
+                    last_x = current_x;
+                    last_y = current_y;
+                }
+            } else if (event.type == ButtonPress) {
+                if (event.xbutton.button == Button4) {
+                    mouse.wheel_movement_handler(1); // Wheel up
+                } else if (event.xbutton.button == Button5) {
+                    mouse.wheel_movement_handler(-1); // Wheel down
+                } else {
+                    mouse.button_pressed_handler(event.xbutton.button);
+                }
+            } else if (event.type == ButtonRelease) {
+                if (event.xbutton.button != Button4 && event.xbutton.button != Button5) {
+                    mouse.button_released_handler(event.xbutton.button);
+                }
+            }
         }
-        else if (event.type == KeyRelease)
-        {
-            KeySym keysym = XLookupKeysym(&event.xkey, 0);
 
-            kb.key_up_handler(keysym);
-        }
-        /* dummy x11 screen entry/exit events */
-        else if (event.type == EnterNotify && !eventLoopRunOnce)
-        {
-            eventLoopRunOnce = 1;
-        }
-        else if (event.type == EnterNotify && eventLoopRunOnce)
-        {
-            printf("EnterWindow: x: %d, y: %d \n");
-        }
-        else if (event.type == LeaveNotify)
-        {
-            printf("LeaveWindow: x: %d, y: %d \n");
-        }
-        else if (event.type == MotionNotify)
-        {
-            mouse.update_position(event.xmotion.x, event.xmotion.y);
-
-            mouse.send_mouse_report();
-        }
-	else if (event.type == ButtonPress)
-	{
-            printf("ButtonPress %d\n", event.xbutton.button);
-            mouse.button_pressed_handler(event.xbutton.button);
-            mouse.send_mouse_report();
-	}
-	else if (event.type == ButtonRelease)
-	{
-            printf("ButtonRelease %d\n", event.xbutton.button);
-            mouse.button_released_handler(event.xbutton.button);
-	    mouse.send_mouse_report();
-	}
-
+        // Continuously send keyboard reports to ensure responsiveness
         kb.send_keyboard_reports();
     }
 
-    /* close connection to server */
+    fclose(kbd_pipe);
+    fclose(mouse_pipe);
     XCloseDisplay(display);
-
     return 0;
 }
